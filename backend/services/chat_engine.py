@@ -1,276 +1,264 @@
 """
-services/chat_engine.py — Rule-based chat response engine.
+services/chat_engine.py — Groq-powered AI chat engine.
 
-Reads the user's live DB state to produce contextual, XPilot-specific
-replies. No generic AI, no placeholders — every response references
-real session data, energy, or consistency metrics.
-
-Extensibility: replace _build_student_reply / _build_worker_reply
-with an LLM call at any time — the route contract doesn't change.
+Loads comprehensive user context (sessions, tasks, projects, XP, energy, ELO,
+achievements) and sends it to Groq LLM for deeply personalised analysis and
+actionable ideas — for both student and worker roles.
 """
+import os
 from datetime import datetime, timedelta, date
 from sqlalchemy.orm import Session as DBSession
-from models import User, Session as SessionModel, EnergyLog, XPLog
+from models import (
+    User, Session as SessionModel, EnergyLog, XPLog,
+    UserTask, Project, Challenge, MatchResult,
+)
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL   = "llama-3.3-70b-versatile"
 
 
-# ── Intent resolution ─────────────────────────────────────────────────────────
-# Maps keywords in the user's message to intent labels.
-
-STUDENT_INTENTS = {
-    "start":        ["start", "begin", "go", "session", "practice"],
-    "progress":     ["progress", "xp", "points", "how am i", "stats", "score"],
-    "consistency":  ["streak", "habit", "consistent", "days", "frequency"],
-    "review":       ["review", "recall", "retention", "remember", "what did"],
-    "motivation":   ["tired", "unmotivated", "bored", "why", "worth", "hard"],
-    "advice":       ["advice", "suggest", "recommend", "what should", "help", "next"],
-}
-
-WORKER_INTENTS = {
-    "energy":       ["energy", "tired", "level", "how do i feel", "capacity"],
-    "schedule":     ["schedule", "plan", "today", "generate", "workload"],
-    "deep_work":    ["deep work", "focus", "important", "priority", "main task"],
-    "break":        ["break", "rest", "recover", "pause", "burnout", "too much"],
-    "advice":       ["advice", "suggest", "recommend", "what should", "help", "next"],
-    "performance":  ["performance", "output", "productivity", "stats", "how am i"],
-}
+def _groq_client():
+    from groq import Groq
+    return Groq(api_key=GROQ_API_KEY)
 
 
-def resolve_intent(message: str, intent_map: dict) -> str:
-    msg = message.lower()
-    scores = {intent: 0 for intent in intent_map}
-    for intent, keywords in intent_map.items():
-        for kw in keywords:
-            if kw in msg:
-                scores[intent] += 1
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "advice"
+# ── Context loader ─────────────────────────────────────────────────────────────
+
+def _load_full_context(db: DBSession, user: User) -> dict:
+    now        = datetime.utcnow()
+    today      = now.date()
+    week_start = today - timedelta(days=6)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Sessions
+    all_sessions = (
+        db.query(SessionModel)
+        .filter(SessionModel.user_id == user.id)
+        .all()
+    )
+    completed_sessions = [s for s in all_sessions if s.duration_minutes]
+    today_sessions     = [s for s in completed_sessions if s.end_time and s.end_time.date() == today]
+    week_sessions      = [s for s in completed_sessions if s.end_time and s.end_time.date() >= week_start]
+
+    today_focus   = round(sum(s.duration_minutes for s in today_sessions))
+    week_focus    = round(sum(s.duration_minutes for s in week_sessions))
+    avg_session   = round(sum(s.duration_minutes for s in completed_sessions) / len(completed_sessions)) if completed_sessions else 0
+    total_sessions = len(completed_sessions)
+
+    session_dates = {s.start_time.date() for s in completed_sessions}
+    last_7_dates  = {(now - timedelta(days=i)).date() for i in range(7)}
+    active_days   = len(session_dates & last_7_dates)
+    consistency   = round(active_days / 7 * 100)
+
+    last_session = max(completed_sessions, key=lambda s: s.end_time, default=None) if completed_sessions else None
+    idle_minutes = round((now - last_session.end_time).total_seconds() / 60) if last_session and last_session.end_time else None
+
+    # XP
+    xp_logs = db.query(XPLog).filter(XPLog.user_id == user.id).all()
+    xp_today = sum(x.xp_awarded for x in xp_logs if x.created_at >= today_start)
+    xp_week  = sum(x.xp_awarded for x in xp_logs if x.created_at >= datetime.combine(week_start, datetime.min.time()))
+
+    # Energy
+    energy_log = (
+        db.query(EnergyLog)
+        .filter(EnergyLog.user_id == user.id, EnergyLog.date == today)
+        .first()
+    )
+    energy_level = energy_log.level if energy_log else None
+
+    # Energy trend (last 7 days)
+    energy_trend = (
+        db.query(EnergyLog)
+        .filter(EnergyLog.user_id == user.id, EnergyLog.date >= week_start)
+        .order_by(EnergyLog.date.asc())
+        .all()
+    )
+    energy_trend_str = ", ".join(f"{e.date.strftime('%a')}:{e.level}" for e in energy_trend) or "No data"
+
+    # Tasks
+    all_tasks      = db.query(UserTask).filter(UserTask.user_id == user.id).all()
+    pending_tasks  = [t for t in all_tasks if t.status == "pending"]
+    active_tasks   = [t for t in all_tasks if t.status == "active"]
+    completed_tasks = [t for t in all_tasks if t.status == "completed"]
+
+    high_priority   = [t for t in pending_tasks if t.priority == "high"]
+    total_est_mins  = sum(t.estimated_minutes for t in pending_tasks + active_tasks)
+
+    # Projects
+    projects = db.query(Project).filter(Project.user_id == user.id).all()
+    project_names = [p.name for p in projects]
+
+    # Arena (worker only)
+    arena_data = {}
+    if user.role == "worker":
+        challenges_won = (
+            db.query(MatchResult)
+            .filter(MatchResult.winner_id == user.id)
+            .count()
+        )
+        total_challenges = (
+            db.query(Challenge)
+            .filter(
+                (Challenge.challenger_id == user.id) | (Challenge.opponent_id == user.id),
+                Challenge.status == "finished",
+            )
+            .count()
+        )
+        arena_data = {
+            "elo_rating": user.elo_rating,
+            "rank_points": user.rank_points,
+            "challenges_won": challenges_won,
+            "total_challenges": total_challenges,
+            "win_rate": round((challenges_won / total_challenges) * 100) if total_challenges else 0,
+        }
+
+    # 7-day output trend
+    trend_dict = {(week_start + timedelta(days=i)).isoformat(): 0 for i in range(7)}
+    for s in week_sessions:
+        if s.end_time:
+            key = s.end_time.date().isoformat()
+            if key in trend_dict:
+                trend_dict[key] += round(s.duration_minutes or 0)
+    trend_str = ", ".join(f"{k[-5:]}:{v}m" for k, v in trend_dict.items())
+
+    return {
+        "name": user.name,
+        "role": user.role,
+        "xp_total": user.xp,
+        "xp_today": xp_today,
+        "xp_week": xp_week,
+        "today_focus_minutes": today_focus,
+        "week_focus_minutes": week_focus,
+        "avg_session_minutes": avg_session,
+        "total_sessions": total_sessions,
+        "sessions_today": len(today_sessions),
+        "active_days_this_week": active_days,
+        "consistency_pct": consistency,
+        "idle_minutes": idle_minutes,
+        "energy_today": energy_level,
+        "energy_trend_7d": energy_trend_str,
+        "pending_tasks": [(t.title, t.priority, t.estimated_minutes) for t in pending_tasks[:8]],
+        "active_task": active_tasks[0].title if active_tasks else None,
+        "completed_tasks_count": len(completed_tasks),
+        "high_priority_count": len(high_priority),
+        "total_pending_minutes": total_est_mins,
+        "projects": project_names,
+        "7day_focus_trend": trend_str,
+        **arena_data,
+    }
 
 
-# ── Main entry ────────────────────────────────────────────────────────────────
+# ── System prompts ─────────────────────────────────────────────────────────────
+
+def _build_system_prompt(ctx: dict) -> str:
+    role = ctx["role"]
+
+    base = f"""You are XPilot AI — an elite, hyper-personalised productivity intelligence system embedded in the XPilot platform.
+
+You have full access to the user's real-time data. Analyse everything and deliver sharp, specific, actionable intelligence.
+
+RULES:
+- Never be generic. Every insight must reference the user's actual numbers.
+- Be direct, concise, and confident. No filler phrases.
+- Always give at least one concrete "do this right now" recommendation.
+- If the user asks a question, answer it AND add one proactive insight from their data.
+- Max 3–4 sentences unless a detailed breakdown is specifically requested.
+
+USER PROFILE:
+- Name: {ctx['name']}
+- Role: {role.upper()}
+- Total XP: {ctx['xp_total']} | XP Today: {ctx['xp_today']} | XP This Week: {ctx['xp_week']}
+- Total Sessions: {ctx['total_sessions']}
+- Today: {ctx['sessions_today']} session(s), {ctx['today_focus_minutes']} minutes of focus
+- This Week: {ctx['week_focus_minutes']} minutes, active {ctx['active_days_this_week']}/7 days ({ctx['consistency_pct']}% consistency)
+- Avg Session Length: {ctx['avg_session_minutes']} min
+- Idle Since Last Session: {f"{ctx['idle_minutes']} minutes ago" if ctx['idle_minutes'] is not None else 'No sessions yet'}
+- 7-Day Focus Trend: {ctx['7day_focus_trend']}
+- Energy Today: {ctx['energy_today'] if ctx['energy_today'] else 'Not logged'}/10
+- Energy Trend (7d): {ctx['energy_trend_7d']}
+"""
+
+    if role == "worker":
+        pending_str = "\n".join(
+            f"  • [{p}] {t} (~{m}m)" for t, p, m in ctx["pending_tasks"]
+        ) or "  None"
+        base += f"""
+WORK STATUS:
+- Active Task: {ctx['active_task'] or 'None'}
+- Pending Tasks ({len(ctx['pending_tasks'])} shown):
+{pending_str}
+- High Priority Backlog: {ctx['high_priority_count']} tasks
+- Total Estimated Workload: {ctx['total_pending_minutes']} minutes
+- Completed Tasks (all time): {ctx['completed_tasks_count']}
+- Projects: {', '.join(ctx['projects']) or 'None'}
+
+FOCUS ARENA (ELO Competitive):
+- ELO Rating: {ctx.get('elo_rating', 'N/A')}
+- Rank Points: {ctx.get('rank_points', 0)}
+- Arena Record: {ctx.get('challenges_won', 0)}W / {ctx.get('total_challenges', 0)} matches ({ctx.get('win_rate', 0)}% win rate)
+"""
+    else:  # student
+        pending_str = "\n".join(
+            f"  • [{p}] {t} (~{m}m)" for t, p, m in ctx["pending_tasks"]
+        ) or "  None"
+        base += f"""
+STUDY STATUS:
+- Active Task: {ctx['active_task'] or 'None'}
+- Pending Study Tasks ({len(ctx['pending_tasks'])} shown):
+{pending_str}
+- Completed Tasks (all time): {ctx['completed_tasks_count']}
+- Total Estimated Remaining: {ctx['total_pending_minutes']} minutes
+- Subjects/Tracks: {', '.join(ctx['projects']) or 'None'}
+"""
+
+    base += "\nNow respond to the user's message with sharp, data-driven intelligence:"
+    return base
+
+
+# ── Main entry ─────────────────────────────────────────────────────────────────
 
 def get_chat_response(db: DBSession, user: User, message: str) -> dict:
     """
-    Reads live user state, resolves intent from message, builds reply.
-    Returns { reply: str, action: str | None }
+    Loads full user context and sends to Groq LLM.
+    Returns { reply: str, action: str | None, intent: str }
     """
-    ctx = _load_context(db, user)
+    ctx = _load_full_context(db, user)
 
-    if user.role == "worker":
-        intent = resolve_intent(message, WORKER_INTENTS)
-        reply, action = _build_worker_reply(intent, ctx)
-    else:
-        intent = resolve_intent(message, STUDENT_INTENTS)
-        reply, action = _build_student_reply(intent, ctx)
-
-    return {"reply": reply, "action": action, "intent": intent}
-
-
-# ── Context loader ────────────────────────────────────────────────────────────
-
-def _load_context(db: DBSession, user: User) -> dict:
-    now = datetime.utcnow()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    completed = (
-        db.query(SessionModel)
-        .filter(SessionModel.user_id == user.id, SessionModel.end_time.isnot(None))
-        .all()
-    )
-    today_sessions = [s for s in completed if s.start_time >= today_start]
-    last_session = max(completed, key=lambda s: s.end_time, default=None) if completed else None
-
-    session_dates = {s.start_time.date() for s in completed}
-    last_7 = {(now - timedelta(days=i)).date() for i in range(7)}
-    active_days = len(session_dates & last_7)
-    consistency_pct = round(active_days / 7 * 100)
-
-    xp_today = (
-        db.query(XPLog)
-        .filter(XPLog.user_id == user.id, XPLog.created_at >= today_start)
-        .all()
-    )
-
-    energy_log = (
-        db.query(EnergyLog)
-        .filter(EnergyLog.user_id == user.id, EnergyLog.date == date.today())
-        .first()
-    )
-
-    total_focus_today = sum(s.duration_minutes or 0 for s in today_sessions)
-    minutes_since_last = (
-        (now - last_session.end_time).total_seconds() / 60
-        if last_session else None
-    )
-
-    return {
-        "name": user.name.split()[0],
-        "xp": user.xp,
-        "xp_today": sum(x.xp_awarded for x in xp_today),
-        "sessions_today": len(today_sessions),
-        "total_focus_today": round(total_focus_today),
-        "active_days": active_days,
-        "consistency_pct": consistency_pct,
-        "minutes_since_last": round(minutes_since_last) if minutes_since_last else None,
-        "energy_level": energy_log.level if energy_log else None,
-        "total_xp": user.xp,
-        "total_sessions": len(completed),
-    }
-
-
-# ── Student replies ───────────────────────────────────────────────────────────
-
-def _build_student_reply(intent: str, ctx: dict) -> tuple[str, str | None]:
-    n = ctx["name"]
-    s_today = ctx["sessions_today"]
-    cons = ctx["consistency_pct"]
-    xp = ctx["xp_today"]
-    mins = ctx["minutes_since_last"]
-    active = ctx["active_days"]
-    total_xp = ctx["total_xp"]
-    focus = ctx["total_focus_today"]
-
-    if intent == "start":
-        if s_today == 0:
-            return (
-                f"No practice yet today, {n}. Even a focused 25-minute session activates recall pathways. Start now and earn XP.",
-                "start_session",
-            )
-        if mins and mins < 20:
-            return (
-                f"You just finished a session {mins} minutes ago. Give yourself a quick 10-minute break, then do a retrieval review — write down what you remember without looking at your notes.",
-                "short_review",
-            )
-        return (
-            f"You've done {s_today} session{'s' if s_today > 1 else ''} today ({focus}m of practice). Ready for another? Each additional session compounds retention.",
-            "start_session",
+    try:
+        client = _groq_client()
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": _build_system_prompt(ctx)},
+                {"role": "user",   "content": message},
+            ],
+            temperature=0.65,
+            max_tokens=350,
         )
+        reply = completion.choices[0].message.content.strip()
+        return {"reply": reply, "action": None, "intent": "ai", "source": "groq"}
 
-    if intent == "progress":
+    except Exception as e:
+        # Graceful fallback — inform user and give basic rule-based response
+        fallback = _rule_fallback(ctx, message)
+        return {"reply": fallback, "action": None, "intent": "fallback", "source": "fallback"}
+
+
+# ── Rule-based fallback ────────────────────────────────────────────────────────
+
+def _rule_fallback(ctx: dict, message: str) -> str:
+    """Minimal fallback when Groq is unavailable."""
+    n     = ctx["name"].split()[0]
+    focus = ctx["today_focus_minutes"]
+    tasks = ctx["pending_tasks"]
+    cons  = ctx["consistency_pct"]
+
+    if tasks:
+        top = tasks[0]
         return (
-            f"Today: {s_today} sessions, {focus} minutes focused, +{xp} XP earned. Total XP: {total_xp}. You've been active {active}/7 days this week — consistency score: {cons}%.",
-            None,
+            f"{n}, your top priority is '{top[0]}' [{top[1].upper()}] (~{top[2]}m). "
+            f"You've done {focus}m of focus today with {cons}% consistency this week. Start it now."
         )
-
-    if intent == "consistency":
-        if cons >= 70:
-            return (
-                f"Your consistency is excellent — {active} active days this week ({cons}%). You're forming a real habit. Keep showing up daily to lock it in.",
-                None,
-            )
-        if cons >= 40:
-            return (
-                f"You've practiced {active} out of 7 days this week ({cons}%). You're on the right track — add 2 more sessions this week to cross the habit threshold.",
-                "start_session",
-            )
-        return (
-            f"Consistency is at {cons}% this week — only {active} active day(s). Habit formation requires daily exposure. Even a 15-minute review today will rebuild momentum.",
-            "maintain_streak",
-        )
-
-    if intent == "review":
-        if s_today > 0:
-            return (
-                f"After {s_today} practice session(s) today, spaced review is your best next move. Write down what you remember — retrieval practice is 2× more effective than re-reading.",
-                "short_review",
-            )
-        return (
-            f"To retain what you've been studying, schedule a review session now. Spaced repetition works best when practice is consistent. {cons}% consistency this week.",
-            "start_session",
-        )
-
-    if intent == "motivation":
-        return (
-            f"Progress is real even when it doesn't feel like it. You've earned {total_xp} total XP across {ctx['total_sessions']} sessions. Consistency at {cons}% this week. Small sessions every day beat massive sessions once a week.",
-            "start_session",
-        )
-
-    # Default: advice
-    if s_today == 0:
-        return (
-            f"No sessions yet today, {n}. My recommendation: start a 25-minute focused practice now. After, write a short review to earn XP and reinforce retention.",
-            "start_session",
-        )
-    return (
-        f"You've been active today ({s_today} session(s), {focus}m). Next: review what you covered to drive retention, then rest. You're building the habit.",
-        "short_review",
-    )
-
-
-# ── Worker replies ────────────────────────────────────────────────────────────
-
-def _build_worker_reply(intent: str, ctx: dict) -> tuple[str, str | None]:
-    n = ctx["name"]
-    level = ctx["energy_level"]
-    focus = ctx["total_focus_today"]
-    s_today = ctx["sessions_today"]
-    active = ctx["active_days"]
-    total_xp = ctx["total_xp"]
-
-    if intent == "energy":
-        if level is None:
-            return (
-                f"You haven't logged your energy today, {n}. Your workload plan depends on it. Log your current energy level (1–10) to get a calibrated execution schedule.",
-                "log_energy",
-            )
-        tier = "low" if level <= 3 else "medium" if level <= 6 else "high"
-        tier_msg = {
-            "low": f"Energy at {level}/10 — reduced capacity. Route to admin and low-stakes tasks. Defer all decisions and deep work.",
-            "medium": f"Energy at {level}/10 — solid capacity. You're set for structured 45-minute focus blocks. Use the generated schedule.",
-            "high": f"Energy at {level}/10 — peak capacity. This is your window for deep work. Block interruptions and execute your highest-leverage task now.",
-        }
-        return (tier_msg[tier], "generate_plan")
-
-    if intent == "schedule":
-        if level is None:
-            return (
-                f"To generate an optimised schedule, I need your energy level first. Log it (1–10) and I'll build a workload plan matched to your current capacity.",
-                "log_energy",
-            )
-        return (
-            f"Based on energy level {level}/10, your schedule should prioritise {'admin and recovery' if level <= 3 else '45-min focus blocks' if level <= 6 else '90-min deep work blocks'}. Open your schedule to execute.",
-            "generate_plan",
-        )
-
-    if intent == "deep_work":
-        if level and level >= 7:
-            return (
-                f"Energy at {level}/10 — optimal for deep work. Start a 90-minute block now. Silence all notifications and work on your single most important task.",
-                "generate_plan",
-            )
-        if level:
-            return (
-                f"Energy at {level}/10 isn't ideal for deep work — forcing it at this capacity increases error rate. Focus blocks of 40–50 minutes are better matched to your current state.",
-                "generate_plan",
-            )
-        return ("Log your energy level first so I can validate whether deep work is appropriate right now.", "log_energy")
-
-    if intent == "break":
-        if focus >= 90:
-            return (
-                f"You've logged {focus} minutes of focus today. This is your mandatory break signal — step away for at least 20 minutes before the next block. Sustained output without recovery degrades judgment.",
-                None,
-            )
-        return (
-            f"You've done {focus} minutes of focused work today. A short 10-minute physical break now will sustain your output quality for the next block.",
-            None,
-        )
-
-    if intent == "performance":
-        return (
-            f"Today: {s_today} work session(s), {focus} minutes of focused output. Active {active}/7 days this week. Total XP logged: {total_xp}. {'Strong execution.' if s_today >= 2 else 'Room to add more focused blocks.'}",
-            None,
-        )
-
-    # Default: advice
-    if level is None:
-        return (
-            f"First step: log your energy level. Everything — your schedule, focus block duration, and recovery plan — is calibrated to your current capacity.",
-            "log_energy",
-        )
-    tier = "low" if level <= 3 else "medium" if level <= 6 else "high"
-    advice = {
-        "low": f"With energy at {level}/10, protect your output by staying on admin and reviews. Avoid high-stakes decisions.",
-        "medium": f"Energy at {level}/10. Recommended: two 45-minute focus blocks with a 10-minute break between. Execute your priority task in the first block.",
-        "high": f"Energy at {level}/10 — rare peak window. Start a 90-minute deep work session immediately on your highest-leverage problem.",
-    }
-    return (advice[tier], "generate_plan")
+    if focus > 0:
+        return f"Great work today, {n} — {focus} minutes of focus logged. Review your completed tasks and plan tomorrow."
+    return f"No sessions yet today, {n}. Your consistency is at {cons}% this week. Start a focus session now to keep momentum."

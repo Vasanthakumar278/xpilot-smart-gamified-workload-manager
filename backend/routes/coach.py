@@ -1,7 +1,8 @@
 """
-routes/coach.py — POST /coach/query (original) + POST /coach/advise (worker AI)
+routes/coach.py — POST /coach/query + POST /coach/advise
+Both now powered by Groq AI with full user context.
 """
-import httpx
+import os
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -12,14 +13,30 @@ from routes.deps import get_current_user
 
 router = APIRouter(prefix="/coach", tags=["coach"])
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL   = "llama-3.3-70b-versatile"
 
 
 class CoachRequest(BaseModel):
     message: str = Field(..., min_length=1)
 
 
-# ── Original interactive coach ────────────────────────────────────────────────
+def _groq(system: str, user_msg: str, max_tokens: int = 200) -> str:
+    from groq import Groq
+    client = Groq(api_key=GROQ_API_KEY)
+    completion = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_msg},
+        ],
+        temperature=0.6,
+        max_tokens=max_tokens,
+    )
+    return completion.choices[0].message.content.strip()
+
+
+# ── Interactive coach ──────────────────────────────────────────────────────────
 
 @router.post("/query")
 def coach_query(
@@ -27,6 +44,9 @@ def coach_query(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    now      = datetime.utcnow()
+    week_ago = now - timedelta(days=7)
+
     recent_tasks = (
         db.query(UserTask)
         .filter(UserTask.user_id == current_user.id)
@@ -37,57 +57,47 @@ def coach_query(
     pending_tasks   = [t.title for t in recent_tasks if t.status == "pending"]
     completed_tasks = [t.title for t in recent_tasks if t.status == "completed"]
 
-    now = datetime.utcnow()
     recent_sessions = (
         db.query(SessionModel)
         .filter(
             SessionModel.user_id == current_user.id,
-            SessionModel.start_time >= now - timedelta(days=7),
+            SessionModel.start_time >= week_ago,
         )
         .all()
     )
     total_duration = sum(s.duration_minutes for s in recent_sessions if s.duration_minutes)
 
-    context  = f"User: {current_user.name}\n"
-    context += f"Completed Tasks: {', '.join(completed_tasks) or 'None'}\n"
-    context += f"Pending Tasks: {', '.join(pending_tasks) or 'None'}\n"
-    context += f"Focus Time (7 days): {total_duration} minutes\n"
+    system = f"""You are XPilot Coach — a direct, data-driven productivity coach. One reply, max 2 sentences.
+User: {current_user.name} | Role: {current_user.role.upper()}
+Completed (recent): {', '.join(completed_tasks) or 'None'}
+Pending: {', '.join(pending_tasks) or 'None'}
+Focus time this week: {total_duration} minutes across {len(recent_sessions)} sessions.
+Give one sharp, actionable response referencing their actual data."""
 
-    prompt = f"""You are a strict, direct, and motivating productivity coach.
-Based on this history:
-{context}
-Answer the user question directly and concisely. Suggest the single best next action.
-User question: {body.message}"""
-
-    if pending_tasks:
-        reply = f"System Offline. Your immediate priority is: '{pending_tasks[0]}'. Block distractions and execute."
-    elif completed_tasks:
-        reply = f"System Offline. Good work on '{completed_tasks[0]}'. Take a short break, then review your next objective."
-    elif total_duration > 0:
-        reply = f"System Offline. You've logged {total_duration} minutes of focus this week. Maintain your consistency."
-    else:
-        reply = "System Offline. Your activity log is empty. Start a new focus session right now to build momentum."
+    try:
+        reply = _groq(system, body.message, max_tokens=150)
+    except Exception:
+        if pending_tasks:
+            reply = f"Your immediate priority is '{pending_tasks[0]}'. Block distractions and execute."
+        elif completed_tasks:
+            reply = f"Good work on '{completed_tasks[0]}'. Take a short break, then review your next objective."
+        else:
+            reply = f"You've logged {total_duration}m of focus this week. Maintain your consistency."
 
     return {"reply": reply}
 
 
-# ── New actionable advise endpoint (Ollama + fallback) ───────────────────────
+# ── Proactive advise (nudge) ───────────────────────────────────────────────────
 
 @router.post("/advise")
 def coach_advise(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Returns a short, actionable single-sentence suggestion based on:
-    - unfinished tasks (ordered by priority)
-    - recent session data (idle gaps, avg duration)
-    No user message needed — proactive nudge only.
-    """
-    now         = datetime.utcnow()
-    week_ago    = now - timedelta(days=7)
+    """One-sentence proactive nudge based on tasks and session data."""
+    now      = datetime.utcnow()
+    week_ago = now - timedelta(days=7)
 
-    # Gather context
     pending_tasks = (
         db.query(UserTask)
         .filter(
@@ -108,58 +118,34 @@ def coach_advise(
         .all()
     )
 
-    total_min    = sum(s.duration_minutes or 0 for s in recent_sessions)
+    total_min     = sum(s.duration_minutes or 0 for s in recent_sessions)
     session_count = len(recent_sessions)
-    avg_min      = round(total_min / session_count) if session_count else 0
+    avg_min       = round(total_min / session_count) if session_count else 0
 
-    # Detect idle gap: hours since last session
-    last = max(
-        (s.end_time for s in recent_sessions if s.end_time),
-        default=None,
-    )
+    last = max((s.end_time for s in recent_sessions if s.end_time), default=None)
     idle_hours = round((now - last).total_seconds() / 3600, 1) if last else None
 
-    # Build task summary
     task_lines = "\n".join(
         f"- [{t.priority.upper()}] {t.title} (~{t.estimated_minutes}m)"
         for t in pending_tasks
     ) or "No pending tasks."
 
-    prompt = f"""You are a direct productivity coach. Respond with ONE sentence only. No explanations. No lists.
-
+    system = f"""You are XPilot Coach. Respond with ONE sentence only. No punctuation at the end. No lists.
 Worker: {current_user.name}
 Pending tasks:
 {task_lines}
-Recent sessions: {session_count} sessions, avg {avg_min} min each, {f'{idle_hours}h idle' if idle_hours is not None else 'no recent sessions'}.
+Sessions this week: {session_count}, avg {avg_min}m each, {f'{idle_hours}h idle' if idle_hours else 'no sessions yet'}.
+Give the single most urgent action they should take right now."""
 
-Give ONE short, direct action they should take right now. Use the task name if relevant."""
-
-    # Try Ollama first
     try:
-        response = httpx.post(
-            OLLAMA_URL,
-            json={"model": "mistral", "prompt": prompt, "stream": False},
-            timeout=10.0,
-        )
-        if response.status_code == 200:
-            advice = response.json().get("response", "").strip()
-            if advice:
-                return {"advice": advice, "source": "ollama"}
+        advice = _groq(system, "What should I do right now?", max_tokens=80)
+        return {"advice": advice, "source": "groq"}
     except Exception:
-        pass  # Ollama unavailable — use rule-based fallback
-
-    # Rule-based fallback
-    if pending_tasks:
-        top = pending_tasks[0]
-        if top.priority == "high":
+        if pending_tasks:
+            top = pending_tasks[0]
             advice = f"Start '{top.title}' immediately — it's your highest priority right now."
-        elif idle_hours and idle_hours > 2:
-            advice = f"You've been idle for {idle_hours}h — open '{top.title}' and set a {top.estimated_minutes}-minute timer."
+        elif session_count > 0:
+            advice = "All tasks complete — log a reflection or plan tomorrow's tasks."
         else:
-            advice = f"Your next task is '{top.title}' (~{top.estimated_minutes}m) — start it before checking anything else."
-    elif session_count > 0:
-        advice = f"All tasks complete. Log a reflection or add tomorrow's tasks while your memory is fresh."
-    else:
-        advice = "No sessions this week. Create one task, set a 25-minute timer, and begin."
-
-    return {"advice": advice, "source": "fallback"}
+            advice = "No sessions this week — create one task, set a 25-minute timer, and begin."
+        return {"advice": advice, "source": "fallback"}
