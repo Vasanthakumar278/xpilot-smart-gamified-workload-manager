@@ -95,7 +95,7 @@ export default function ChatWindow({ onClose, role }) {
                             XPilot Coach
                         </div>
                         <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.7)', marginTop: 1 }}>
-                            History-aware · Local Mistral ML
+                            Powered by Groq · llama-3.3-70b
                         </div>
                     </div>
                 </div>
