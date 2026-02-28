@@ -1,6 +1,7 @@
 """
 routes/deps.py — Shared dependency: get the current authenticated user
 """
+import os
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 
-SECRET_KEY = "xpilot-secret-key-change-in-production"
+SECRET_KEY = os.getenv("SECRET_KEY", "xpilot-secret-key-change-in-production")
 ALGORITHM = "HS256"
 
 security = HTTPBearer()

@@ -7,3 +7,4 @@ python-multipart==0.0.12
 pydantic[email]==2.9.2
 httpx
 python-dotenv
+psycopg2-binary==2.9.9

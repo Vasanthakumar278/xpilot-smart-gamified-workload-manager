@@ -1,6 +1,7 @@
 """
 routes/auth.py — User registration and login
 """
+import os
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -13,7 +14,7 @@ from models import User
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 # Security config
-SECRET_KEY = "xpilot-secret-key-change-in-production"
+SECRET_KEY = os.getenv("SECRET_KEY", "xpilot-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
