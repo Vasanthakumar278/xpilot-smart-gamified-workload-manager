@@ -2,10 +2,11 @@
  * components/Sidebar.jsx — Fixed left navigation
  */
 import { useNavigate, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Calendar, BarChart2, Award, LogOut, Zap } from 'lucide-react';
+import { LayoutDashboard, Calendar, BarChart2, Award, LogOut, Zap, Timer } from 'lucide-react';
 
 const NAV_ITEMS = [
     { icon: <LayoutDashboard size={18} />, label: 'Dashboard', path: '/student/dashboard' },
+    { icon: <Timer size={18} />, label: 'Study Room', path: '/student/study' },
     { icon: <Calendar size={18} />, label: 'Schedule', path: '/student/schedule' },
     { icon: <BarChart2 size={18} />, label: 'Analytics', path: '/student/analytics' },
     { icon: <Award size={18} />, label: 'XP History', path: '/student/xp' },

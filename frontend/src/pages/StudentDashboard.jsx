@@ -2,6 +2,7 @@
  * pages/StudentDashboard.jsx — Restored Student Dashboard with Zen aesthetics
  */
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Sparkles, Timer, Flame, Calendar, Target, Plus } from 'lucide-react';
 import AnalyticsCard from '../components/AnalyticsCard';
 import client from '../api/client';
@@ -13,6 +14,7 @@ export default function StudentDashboard() {
     const [analytics, setAnalytics] = useState(null);
     const [loading, setLoading] = useState(true);
     const user = JSON.parse(localStorage.getItem('xpilot_user') || '{}');
+    const navigate = useNavigate();
 
     async function loadData() {
         try {
@@ -62,7 +64,7 @@ export default function StudentDashboard() {
             <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '32px' }}>
                 {/* Left Column */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
-                    <StudySessionCard onStart={() => console.log('Start session')} />
+                    <StudySessionCard onStart={() => navigate('/student/study')} />
 
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px' }}>
                         <CourseworkCard />
@@ -93,7 +95,7 @@ export default function StudentDashboard() {
                             alignItems: 'center',
                             gap: '8px',
                             cursor: 'pointer'
-                        }}>
+                        }} onClick={() => navigate('/student/groups')}>
                             <Plus size={18} /> Explore
                         </button>
                     </div>

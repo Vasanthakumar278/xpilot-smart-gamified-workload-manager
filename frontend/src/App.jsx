@@ -9,6 +9,7 @@ import WorkerDashboard from './pages/WorkerDashboard';
 import Schedule from './pages/Schedule';
 import Analytics from './pages/Analytics';
 import XPHistory from './pages/XPHistory';
+import StudyGroups from './pages/StudyGroups';
 import StudentLayout from './layout/StudentLayout';
 import WorkerLayout from './layout/WorkerLayout';
 import DeepWork from './pages/worker/DeepWork';
@@ -43,6 +44,7 @@ function StudentApp() {
         <Route path="dashboard" element={<StudentDashboard />} />
         <Route path="study" element={<Dashboard />} />
         <Route path="schedule" element={<Schedule />} />
+        <Route path="groups" element={<StudyGroups />} />
         <Route path="analytics" element={<Analytics />} />
         <Route path="xp" element={<XPHistory />} />
         <Route path="*" element={<Navigate to="dashboard" replace />} />
